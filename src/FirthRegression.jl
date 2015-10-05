@@ -4,6 +4,10 @@ using Reexport, Compat
 using GLM: wrkwt!, installbeta!
 export FirthGLM, penalized_deviance, anova
 
+"""
+Second derivative of mu with respect to eta.
+"""
+function mueta2 end
 mueta2(::LogitLink, η) = (e = exp(η); (e*(1-e))/(1+e)^3)
 mueta2(::LogLink, η) = exp(η)
 # Need to figure out how to compute the deviance for non-canonical links if we want to use them
@@ -26,11 +30,14 @@ type FirthGLMTest{G<:FirthGlmResp,L<:LinPred} <: GLM.AbstractGLM
     fit::Bool
 end
 
+"""
+Update just the factorization of the X'WX, without computing new betas.
+"""
+function updatefact end
 function updatefact!{T}(p::GLM.DensePredChol{T}, wt::Vector{T})
     scr = scale!(p.scratch, wt, p.X)
     cholfact!(At_mul_B!(GLM.cholfactors(p.chol), scr, p.X), :U)
 end
-
 @eval function updatefact!{T}(p::GLM.SparsePredChol{T}, wt::Vector{T})
     scr = scale!(p.scratch, wt, p.X)
     XtX = p.Xt*scr
@@ -41,20 +48,45 @@ end
     end)
 end
 
+updatefact!(m::FirthGLM) = updatefact!(m.pp, wrkwt!(m.rr))
+function updatefact!(m::FirthGLMTest)
+    wt = wrkwt!(m.rr)
+    updatefact!(m.pp, wt)
+    updatefact!(m.pp_full, wt)
+end
+
+"""
+Compute delbeta, without recomputing the factorization of X'WX.
+"""
+function updatedelbeta end
+function updatedelbeta!{T}(p::GLM.DensePredChol{T}, r::Vector{T})
+    A_ldiv_B!(p.chol, At_mul_B!(p.delbeta, p.scratch, r))
+    p
+end
+function updatedelbeta!{T}(p::GLM.SparsePredChol{T}, r::Vector{T})
+    p.delbeta = p.chol\Ac_mul_B!(p.delbeta, p.scratch, r)
+end
+
+"""
+Compute the diagonal of the hat matrix.
+"""
+function hatdiag end
 hatdiag(p::GLM.DensePredChol, wt::Vector) = vec(sumabs2(p.X/p.chol[:U], 2)).*wt
-hatdiag(p::GLM.SparsePredChol, wt::Vector) = vec(sumabs2(p.chol[:PtL]\p.Xt, 1)).*wt
+hatdiag(p::GLM.SparsePredChol, wt::Vector) = vec(sumabs2(p.chol[:L]\p.Xt[p.chol[:p], :], 1)).*wt
 
-hatdiag(m::FirthGLM, wt::Vector) = hatdiag(m.pp, wt)
-hatdiag(m::FirthGLMTest, wt::Vector) = hatdiag(m.pp_full, wt)
+hatdiag(m::FirthGLM) = hatdiag(m.pp, m.rr.wrkwts)
+hatdiag(m::FirthGLMTest) = hatdiag(m.pp_full, m.rr.wrkwts)
 
-function adjustwrkresid!(m::@compat(Union{FirthGLM,FirthGLMTest}), wt::Vector)
+"""
+Adjust working residuals using the given hat matrix diagonal `h`.
+"""
+function adjustwrkresid!(m::@compat(Union{FirthGLM,FirthGLMTest}), h::Vector)
     r = m.rr
     link = r.l
     eta = r.eta
     mueta = r.mueta
     var = r.var
     wrkresid = r.wrkresid
-    h = hatdiag(m, wt)
     @inbounds @simd for i = 1:length(eta)
         # See Kosmidis and Firth, 2009, 4⋅3
         wrkresid[i] += h[i]*mueta2(link, eta[i])/(2*mueta[i]^3/var[i])
@@ -62,11 +94,13 @@ function adjustwrkresid!(m::@compat(Union{FirthGLM,FirthGLMTest}), wt::Vector)
     r
 end
 
+"""
+Compute the penalized deviance. This requires that updatefact! has been
+called since the working weights were last updated.
+"""
+function penalized_deviance end
 penalized_deviance(m::FirthGLM) = deviance(m.rr) - logdet(m.pp.chol)
-function penalized_deviance(m::FirthGLMTest)
-    updatefact!(m.pp_full, m.rr.wrkwts)
-    deviance(m.rr) - logdet(m.pp_full.chol)
-end
+penalized_deviance(m::FirthGLMTest) = deviance(m.rr) - logdet(m.pp_full.chol)
 
 function GLM._fit!(m::@compat(Union{FirthGLM,FirthGLMTest}), verbose::Bool, maxIter::Integer, minStepFac::Real,
                   convTol::Real, start)
@@ -76,69 +110,53 @@ function GLM._fit!(m::@compat(Union{FirthGLM,FirthGLMTest}), verbose::Bool, maxI
 
     cvg = false; p = m.pp; r = m.rr
     lp = r.mu
-    # if start != nothing
-    #     copy!(p.beta0, start)
-    #     fill!(p.delbeta, 0)
-    #     linpred!(lp, p)
-    #     updatemu!(r, lp)
-    # end
-    delbeta!(p, wrkresp(r), wrkwt!(r))
-    if isa(m, FirthGLMTest)
-        updatefact!(m.pp_full, m.rr.wrkwts)
+    if start != nothing
+        copy!(p.beta0, start)
+        fill!(p.delbeta, 0)
+    else
+        delbeta!(p, wrkresp(r), wrkwt!(r))
+        installbeta!(p)
     end
-    installbeta!(p)
-    oldwrkwts = similar(r.wrkwts)
     devold = Inf
     for i=1:maxIter
         f = 1.0
         local dev
-        copy!(oldwrkwts, r.wrkwts)
+        linpred!(lp, p)
         try
-            linpred!(lp, p)
             updatemu!(r, lp)
-            adjustwrkresid!(m, oldwrkwts)
-            delbeta!(p, r.wrkresid, wrkwt!(r))
+            updatefact!(m)
             dev = penalized_deviance(m)
         catch e
             isa(e, DomainError) ? (dev = Inf) : rethrow(e)
         end
         dev == NaN && (dev = Inf)
+
         while dev > devold
             f /= 2.; f > minStepFac || error("step-halving failed at beta0 = $(p.beta0)")
+            verbose && println("step-halving $f: $dev")
             try
                 updatemu!(r, linpred(p, f))
-                adjustwrkresid!(m, oldwrkwts)
-                delbeta!(p, r.wrkresid, wrkwt!(r))
+                updatefact!(m)
                 dev = penalized_deviance(m)
             catch e
                 isa(e, DomainError) ? (dev = Inf) : rethrow(e)
             end
             dev == NaN && (dev = Inf)
         end
+
         installbeta!(p, f)
+
         crit = (devold - dev)/dev
-        verbose && println("$i: $dev, $crit, $(p.beta0)")
+        verbose && println("$i: $dev, $crit")
         if crit < convTol; cvg = true; break end
+
         devold = dev
+        adjustwrkresid!(m, hatdiag(m))
+        updatedelbeta!(p, r.wrkresid)
     end
     cvg || error("failure to converge in $maxIter iterations")
     m.fit = true
     m
-end
-
-function adjustwrkresid!(m::FirthGLMTest, wt::Vector)
-    r = m.rr
-    link = r.l
-    eta = r.eta
-    mueta = r.mueta
-    var = r.var
-    wrkresid = r.wrkresid
-    h = hatdiag(m.pp_full, wt)
-    @inbounds @simd for i = 1:length(eta)
-        # See Kosmidis and Firth, 2009, 4⋅3
-        wrkresid[i] += h[i]*mueta2(link, eta[i])/(2*mueta[i]^3/var[i])
-    end
-    r
 end
 
 cols(X::AbstractMatrix) = [sub(X, :, i) for i = 1:size(X, 2)]
