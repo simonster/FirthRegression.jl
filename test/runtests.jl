@@ -32,3 +32,11 @@ anv = anova(fit(FirthGLM, admit ~ gre + gpa + rank, df, Binomial(), convTol=1e-1
 @test anv.df == 3
 @test_approx_eq anv.p 8.8071001596912168e-05
 
+## ANOVA with sparse matrix
+anvdense = anova(fit(FirthGLM, full(X[:, 1:5]), y, Binomial(), convTol=1e-14),
+                 gmdense, convTol=1e-14)
+anvsparse = anova(fit(FirthGLM, X[:, 1:5], y, Binomial(), convTol=1e-14),
+                  gmsparse, convTol=1e-14)
+@test_approx_eq anvdense.chisq anvsparse.chisq
+@test anvdense.df == anvsparse.df
+@test_approx_eq anvdense.p anvsparse.p

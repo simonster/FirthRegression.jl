@@ -31,19 +31,18 @@ function updatefact!{T}(p::GLM.DensePredChol{T}, wt::Vector{T})
     cholfact!(At_mul_B!(GLM.cholfactors(p.chol), scr, p.X), :U)
 end
 
-function updatefact!{T}(p::GLM.SparsePredChol{T}, wt::Vector{T})
+@eval function updatefact!{T}(p::GLM.SparsePredChol{T}, wt::Vector{T})
     scr = scale!(p.scratch, wt, p.X)
     XtX = p.Xt*scr
-    c = p.chol = $(if VERSION >= v"0.4.0-dev+3307"
+    p.chol = $(if VERSION >= v"0.4.0-dev+3307"
         :(cholfact(Symmetric{eltype(XtX),typeof(XtX)}(XtX, 'U')))
     else
         :(cholfact(scale!(XtX + XtX', convert(eltype(XtX), 1/2))))
     end)
 end
 
-# TODO make this more efficient
-hatdiag(p::GLM.DensePredChol, wt::Vector) = sum(p.X.*(p.chol\p.scratch')', 2)
-hatdiag(p::GLM.SparsePredChol, wt::Vector) = sum(p.X.*(p.chol\p.Xt)', 2).*wt
+hatdiag(p::GLM.DensePredChol, wt::Vector) = vec(sumabs2(p.X/p.chol[:U], 2)).*wt
+hatdiag(p::GLM.SparsePredChol, wt::Vector) = vec(sumabs2(p.chol[:PtL]\p.Xt, 1)).*wt
 
 hatdiag(m::FirthGLM, wt::Vector) = hatdiag(m.pp, wt)
 hatdiag(m::FirthGLMTest, wt::Vector) = hatdiag(m.pp_full, wt)
@@ -77,12 +76,12 @@ function GLM._fit!(m::@compat(Union{FirthGLM,FirthGLMTest}), verbose::Bool, maxI
 
     cvg = false; p = m.pp; r = m.rr
     lp = r.mu
-    if start != nothing
-        copy!(p.beta0, start)
-        fill!(p.delbeta, 0)
-        linpred!(lp, p)
-        updatemu!(r, lp)
-    end
+    # if start != nothing
+    #     copy!(p.beta0, start)
+    #     fill!(p.delbeta, 0)
+    #     linpred!(lp, p)
+    #     updatemu!(r, lp)
+    # end
     delbeta!(p, wrkresp(r), wrkwt!(r))
     if isa(m, FirthGLMTest)
         updatefact!(m.pp_full, m.rr.wrkwts)
@@ -103,6 +102,7 @@ function GLM._fit!(m::@compat(Union{FirthGLM,FirthGLMTest}), verbose::Bool, maxI
         catch e
             isa(e, DomainError) ? (dev = Inf) : rethrow(e)
         end
+        dev == NaN && (dev = Inf)
         while dev > devold
             f /= 2.; f > minStepFac || error("step-halving failed at beta0 = $(p.beta0)")
             try
@@ -113,10 +113,11 @@ function GLM._fit!(m::@compat(Union{FirthGLM,FirthGLMTest}), verbose::Bool, maxI
             catch e
                 isa(e, DomainError) ? (dev = Inf) : rethrow(e)
             end
+            dev == NaN && (dev = Inf)
         end
         installbeta!(p, f)
         crit = (devold - dev)/dev
-        verbose && println("$i: $dev, $crit")
+        verbose && println("$i: $dev, $crit, $(p.beta0)")
         if crit < convTol; cvg = true; break end
         devold = dev
     end
